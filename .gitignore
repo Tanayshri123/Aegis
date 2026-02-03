@@ -4,3 +4,8 @@
 
 #ignore virtual environment folder
 venv/
+
+test.py
+
+# Ignore __pycache__ folders
+__pycache__/

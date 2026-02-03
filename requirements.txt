@@ -1,2 +1,4 @@
 python-dotenv
 langchain-nvidia-ai-endpoints
+
+PyPDF2
