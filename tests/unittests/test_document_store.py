@@ -1,14 +1,11 @@
 """
 Unit tests for core/document_store.py
 
-Testing Strategy (MEDIUM PRIORITY):
+Testing Strategy main functions:
 - create(): 2 tests (basic creation, ID uniqueness)
 - add_entities(): 2 tests (add entities, multiple adds)
 - get_selected_entities(): 2 tests (filter selected, empty)
 - update_entity_selection(): 1 test (toggle selection)
-
-Total: 7 tests for core state management functions
-Note: Simple getters/setters (get, set_metadata) not tested - trivial
 """
 
 import unittest
