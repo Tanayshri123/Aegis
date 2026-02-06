@@ -1,0 +1,56 @@
+name: Aegis CI Pipeline
+
+# Made for the github actions workflow system to automate CI
+
+# Trigger: Run on every push to main or pull request
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # Runs quickly to check for syntax errors before installing heavy dependencies
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          
+      - name: Install Linting Tools
+        run: |
+          pip install flake8
+          
+      - name: Run Linting
+        # distinct from your requirements.txt, this just checks code style
+        # exclude venv and cache folders
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,__pycache__
+
+  # Stage 2: Unit Tests
+  # Only runs if 'quality' passes
+  tests:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+      - name: Run Unit Tests
+        # targetting the tests/unittests/ directory for unit tests for now
+        run: |
+          python -m unittest discover -s tests/unittests -p "test_*.py"
