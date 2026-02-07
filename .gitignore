@@ -9,3 +9,5 @@ test.py
 
 # Ignore __pycache__ folders
 __pycache__/
+
+.coverage
