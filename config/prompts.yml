@@ -12,7 +12,8 @@ prompts:
           {
             "type": "SSN|EMAIL|PHONE|CREDIT_CARD|NAME|ADDRESS|DATE_OF_BIRTH|ACCOUNT_NUMBER",
             "value": "the exact sensitive value found",
-            "context": "brief surrounding text for verification"
+            "context": "brief surrounding text for verification",
+            "confidence": "your confidence in this finding, as a float from 0.0 to 1.0"
           }
         ]
       }
