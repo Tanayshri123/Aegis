@@ -20,13 +20,24 @@ prompts:
 
       Entity types to detect:
       - SSN: Social Security Numbers (XXX-XX-XXXX format)
+      - EIN: Employer Identification Numbers (XX-XXXXXXX format)
       - EMAIL: Email addresses
       - PHONE: Phone numbers (any format)
       - CREDIT_CARD: Credit card numbers
-      - NAME: Personal names (first, last, full names)
-      - ADDRESS: Physical addresses
+      - NAME: Personal names (first, last, full names) - includes employee and employer names
+      - ADDRESS: Physical addresses (street, city, state, ZIP) - includes employee and employer addresses
       - DATE_OF_BIRTH: Birth dates
       - ACCOUNT_NUMBER: Bank or financial account numbers
+      - EMPLOYER_NAME: Company or employer names
+      - STATE_ID: State-issued identification numbers (e.g., state employer ID)
+      - CONTROL_NUMBER: Document control or reference numbers
+
+      IMPORTANT: For tax forms (W-2, 1099, etc.), be thorough. These documents contain:
+      - Employee names and addresses (often repeated in multiple copies)
+      - Employer names and addresses
+      - SSNs, EINs, state IDs, control numbers
+      - Financial figures (wages, taxes withheld)
+      Extract ALL instances, even if the same value appears in multiple sections.
 
       If no PII is found, return: {"entities": []}
 
