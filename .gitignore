@@ -11,3 +11,7 @@ test.py
 __pycache__/
 
 .coverage
+
+#ignore the skill.md file in the frontend folder + node_modules
+frontend/SKILL.md
+frontend/node_modules/
