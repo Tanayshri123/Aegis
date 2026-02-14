@@ -18,9 +18,10 @@ def get_model():
         raise ValueError("NVIDIA_API_KEY not found. Please create a .env file and add your key.")
 
     return ChatNVIDIA(
-        model="nvidia/llama-3.3-nemotron-super-49b-v1.5", 
-        temperature=0.1, # deterministic output
-        max_tokens=512, # keep output minimal
+        model="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        temperature=0,    # fully deterministic: same input always produces same output
+        max_tokens=4096,  # reasoning models emit <think> tokens before JSON; 512 was
+                          # too low and silently truncated the JSON on complex documents
         api_key=API_KEY
     )
 
