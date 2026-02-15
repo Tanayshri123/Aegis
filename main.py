@@ -19,7 +19,8 @@ from core.nemotron_parser import locate_entities
 from core.redactor import redact_pdf
 
 
-async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
+async def process_pdf(pdf_path: str, use_docker: bool = True, return_entities: bool = False,
+                      progress_callback=None):
     """
     Run the full redaction pipeline on a single PDF.
 
@@ -35,10 +36,18 @@ async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
     Args:
         pdf_path: Path to the input PDF
         use_docker: True for local Docker Nemotron, False for NVIDIA cloud
+        return_entities: If True, return (output_path, entities_list, pages) tuple
+        progress_callback: Optional callable(step, detail) for live progress updates
 
     Returns:
-        Path to the redacted output PDF, or None if nothing to redact
+        Path to the redacted output PDF, or None if nothing to redact.
+        If return_entities=True, returns (path, entities_list, pages) tuple.
     """
+    def _progress(step, detail=""):
+        """Report progress to callback and stdout."""
+        if progress_callback:
+            progress_callback(step, detail)
+
     pdf_path = os.path.abspath(pdf_path)
 
     if not os.path.exists(pdf_path):
@@ -54,6 +63,7 @@ async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
     # Step 1: Extract text
     t0 = time.time()
     print(f"\n[1/4] Extracting text...")
+    _progress(1, "Extracting text from PDF...")
     with open(pdf_path, "rb") as f:
         pages = extract_text_from_pdf(f)
     total_chars = sum(len(p.get("text", "")) for p in pages)
@@ -69,6 +79,7 @@ async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
     # Step 2: Detect PII
     t0 = time.time()
     print(f"\n[2/4] Detecting PII...")
+    _progress(2, "Detecting PII (regex + LLM)...")
     llm = None
     # ChatNVIDIA constructor calls NVIDIA's /models API to validate the model,
     # which can hang if the network is slow. Load in a thread with a 60s timeout.
@@ -105,12 +116,13 @@ async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
             print(f"    [{e.type}] {e.value!r}  (page {e.page}, conf={e.confidence:.2f})")
     else:
         print(f"  No PII detected in {filename}. Nothing to redact.")
-        return None
+        return (None, [], pages) if return_entities else None
 
     # Step 3: Locate bounding boxes
     t0 = time.time()
     mode = "Docker" if use_docker else "Cloud"
     print(f"\n[3/4] Locating bounding boxes ({mode} Nemotron)...")
+    _progress(3, f"Locating bounding boxes ({mode} Nemotron)...")
     entities = await locate_entities(pdf_path, entities, use_docker=use_docker)
 
     entities_with_bbox = [e for e in entities if e.bbox is not None]
@@ -124,15 +136,18 @@ async def process_pdf(pdf_path: str, use_docker: bool = True) -> str:
 
     if not entities_with_bbox:
         print(f"  Could not locate any bounding boxes. Cannot redact.")
-        return None
+        return (None, entities, pages) if return_entities else None
 
     # Step 4: Redact
     t0 = time.time()
     print(f"\n[4/4] Redacting {len(entities_with_bbox)} regions...")
+    _progress(4, f"Redacting {len(entities_with_bbox)} regions...")
     output_path = redact_pdf(pdf_path, entities)
     print(f"  Done  ({time.time()-t0:.1f}s)")
     print(f"\n  Output: {output_path}")
 
+    if return_entities:
+        return output_path, entities, pages
     return output_path
 
 

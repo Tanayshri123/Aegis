@@ -45,11 +45,16 @@ PII_PATTERNS = {
         "context_required": False,
     },
     "PHONE": {
-        "pattern": r'(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)?\d{3}[-.\s]?\d{4}\b',
+        # Require area code (3 digits) + 3-digit exchange + 4-digit subscriber.
+        # The area code is mandatory to avoid matching random 7-digit sequences
+        # (ZIP suffixes, form numbers, EIN fragments, etc.).
+        "pattern": r'(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s])\d{3}[-.\s]?\d{4}\b',
         "context_required": False,
     },
     "CREDIT_CARD": {
-        "pattern": r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',
+        # Require separators between groups to avoid matching 16-digit
+        # sequences that are actually repeated address numbers
+        "pattern": r'\b\d{4}[-\s]\d{4}[-\s]\d{4}[-\s]\d{4}\b',
         "context_required": False,
     },
     "DATE_OF_BIRTH": {
@@ -255,7 +260,26 @@ def deduplicate_entities(entities: List[Entity]) -> List[Entity]:
         else:
             by_value_key[value_key] = entity
 
-    return list(by_value_key.values())
+    # Pass 3: remove substring entities — if value A is a substring of value B
+    # on the same page, drop A (e.g. '5711945' inside EIN '98-5711945',
+    # or '556-9334' inside ZIP '50556-9334')
+    deduped = list(by_value_key.values())
+    all_values_by_page: dict = {}
+    for entity in deduped:
+        all_values_by_page.setdefault(entity.page, []).append(entity.value.strip())
+
+    final = []
+    for entity in deduped:
+        val = entity.value.strip()
+        is_substring = False
+        for other_val in all_values_by_page.get(entity.page, []):
+            if val != other_val and val in other_val:
+                is_substring = True
+                break
+        if not is_substring:
+            final.append(entity)
+
+    return final
 
 
 def scan_document(pages: List[Dict], llm=None) -> List[Entity]:
@@ -281,7 +305,7 @@ def scan_document(pages: List[Dict], llm=None) -> List[Entity]:
             from importlib import import_module
             llm_utils = import_module("llm-utils")
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(llm_utils.get_model)
+                future = pool.submit(llm_utils.get_fast_model)
                 llm = future.result(timeout=30)
         except concurrent.futures.TimeoutError:
             print(f"  Warning: LLM load timed out. Using regex-only mode.")

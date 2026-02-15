@@ -26,6 +26,25 @@ def get_model():
     )
 
 
+def get_chat_model():
+    """
+    Initializes the model for chat interactions (slightly creative, temp=0.1).
+
+    Uses the same Nemotron model but with temperature=0.1 for more natural
+    conversational responses, matching the NeMo Guardrails config.
+    """
+    API_KEY = os.getenv("NVIDIA_API_KEY")
+    if not API_KEY:
+        raise ValueError("NVIDIA_API_KEY not found. Please create a .env file and add your key.")
+
+    return ChatNVIDIA(
+        model="nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        temperature=0.1,
+        max_tokens=4096,
+        api_key=API_KEY
+    )
+
+
 def output_cleaner(response_text):
     """
     Cleans the model's response by removing any <think>...</think> blocks.

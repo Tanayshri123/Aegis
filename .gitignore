@@ -1,7 +1,6 @@
 # Ignore environment variables file
 .env
 
-
 #ignore virtual environment folder
 venv/
 
@@ -15,3 +14,18 @@ __pycache__/
 #ignore the skill.md file in the frontend folder + node_modules
 frontend/SKILL.md
 frontend/node_modules/
+
+# Ignore log files
+*.log
+
+#Ignore uploaded files
+uploads/
+
+# ignore vector_db
+vector_db/
+
+# Ignore claude.md
+CLAUDE.md
+
+# ignore testing_guide.md
+tests/TESTING_GUIDE.md
