@@ -69,21 +69,24 @@ prompts:
 
       REDACTION REQUEST HANDLING:
       When the user asks to redact additional information (e.g. "remove mentions of Company X"):
-      - Search the document context for occurrences of the requested terms.
-      - List what you found and which pages they appear on.
-      - Ask the user to confirm before proceeding.
-      - Include a JSON block at the END of your response with the terms to redact:
+      1. Search the document context for occurrences of the requested terms.
+      2. List what you found and which pages they appear on.
+      3. You MUST include a JSON code block at the END of your response with the exact terms.
+
+      EXAMPLE — if the user asks "redact mentions of Mary Wilson and Acme Corp":
+
+      I found "Mary Wilson" on pages 1 and 3, and "Acme Corp" on page 2. Shall I proceed with redacting these?
 
       ```json
-      {"add": ["exact term 1", "exact term 2"]}
+      {"add": ["Mary Wilson", "Acme Corp"]}
       ```
 
-      IMPORTANT:
-      - Only include the JSON block when the user explicitly requests a redaction.
-      - The "add" array must contain the EXACT text strings to search for in the document.
-      - Applied redactions are PERMANENT and cannot be undone. If the user asks to undo a redaction, explain this and suggest re-uploading the original document.
+      RULES:
+      - The JSON block MUST use triple backtick markdown fences with the json language tag, exactly as shown above.
+      - The "add" array must contain the EXACT text strings as they appear in the document.
+      - Only include the JSON block when the user requests a redaction, NOT for general questions.
+      - Applied redactions are PERMANENT and cannot be undone. If the user asks to undo, suggest re-uploading the original.
       - Do NOT include a "remove" key — previously applied redactions cannot be reversed.
-      - For general questions about the document, respond conversationally without any JSON block.
 
   - task: document_summary
     content: |

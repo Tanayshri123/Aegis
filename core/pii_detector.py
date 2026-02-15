@@ -370,7 +370,14 @@ def find_custom_entities(pages: List[Dict], search_terms: List[str]) -> List[Ent
         if not term or not term.strip():
             continue
 
-        pattern = r'\b' + re.escape(term.strip()) + r'\b'
+        # Normalize whitespace in the search term so "Mary    Smith" matches "Mary Smith"
+        normalized_term = re.sub(r'\s+', ' ', term.strip())
+        # Build pattern that matches any whitespace between words
+        words = normalized_term.split()
+        if len(words) > 1:
+            pattern = r'\b' + r'\s+'.join(re.escape(w) for w in words) + r'\b'
+        else:
+            pattern = r'\b' + re.escape(words[0]) + r'\b'
 
         for page in pages:
             page_num = page["page_number"]

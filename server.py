@@ -94,6 +94,61 @@ def _get_chat_prompt_template() -> str:
     return _chat_prompt_template
 
 
+# ── Direct redaction request detection ────────────────────────────────────
+
+
+def _detect_direct_redaction_request(message: str) -> Optional[list]:
+    """
+    Parse user messages that directly request redaction of specific terms.
+
+    Handles patterns like:
+      - "redact Mary"
+      - "remove all mentions of Mary"
+      - "also redact 'Acme Corp' and 'John Smith'"
+      - "hide the name Mary Wilson"
+      - "redact 'Project Alpha'"
+
+    Returns list of terms to redact, or None if not a redaction request.
+    """
+    msg = message.strip()
+    msg_lower = msg.lower()
+
+    # Check if this is a redaction request at all
+    redaction_verbs = [
+        "redact", "remove", "hide", "delete", "mask", "censor", "black out",
+        "block out", "take out", "get rid of",
+    ]
+    if not any(verb in msg_lower for verb in redaction_verbs):
+        return None
+
+    terms = []
+
+    # Extract quoted terms: "term" or 'term'
+    quoted = re.findall(r"""['"]([^'"]+)['"]""", msg)
+    terms.extend(quoted)
+
+    # If no quoted terms, try to extract the target after common patterns
+    if not terms:
+        # Patterns like "redact Mary", "remove mentions of Mary Wilson",
+        # "redact the name John", "hide all references to Acme Corp"
+        patterns = [
+            r'(?:redact|remove|hide|delete|mask|censor)\s+(?:all\s+)?(?:mentions?\s+(?:of\s+)?|references?\s+(?:to\s+)?|the\s+(?:name|term|word|phrase)\s+)?(.+)',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, msg, re.IGNORECASE)
+            if m:
+                raw = m.group(1).strip().rstrip('.!?')
+                # Split on " and " to support "redact Mary and John"
+                parts = re.split(r'\s+and\s+', raw, flags=re.IGNORECASE)
+                for part in parts:
+                    part = part.strip().strip("'\"")
+                    if part and len(part) > 1:
+                        terms.append(part)
+                break
+
+    return terms if terms else None
+
+
 # ── Redaction intent parsing ───────────────────────────────────────────────
 
 
@@ -384,6 +439,51 @@ async def chat_endpoint(job_id: str, body: ChatRequest):
 
         result = await _execute_chat_redaction(job_id, body.confirmed_terms)
         return result
+
+    # ── Direct redaction request (bypass LLM entirely) ──────────────
+    direct_terms = _detect_direct_redaction_request(body.message)
+    if direct_terms:
+        # Verify terms exist in the document before asking for confirmation
+        from core.pii_detector import find_custom_entities
+        pages = job.get("pages", [])
+        found = find_custom_entities(pages, direct_terms)
+
+        if found:
+            # Group found terms and pages for the confirmation UI
+            found_terms = sorted(set(e.value for e in found))
+            found_pages = sorted(set(e.page for e in found))
+            count = len(found)
+
+            reply = (
+                f"Found {count} occurrence(s) of "
+                f"{', '.join(repr(t) for t in found_terms)} "
+                f"on page(s) {', '.join(str(p) for p in found_pages)}. "
+                f"Click Confirm below to redact."
+            )
+            job["chat_history"].append({"role": "user", "content": body.message})
+            job["chat_history"].append({"role": "assistant", "content": reply})
+            job["pending_redaction"] = {"terms": direct_terms}
+
+            return {
+                "reply": reply,
+                "pages_referenced": found_pages,
+                "redaction_request": {"terms": direct_terms, "pages": found_pages},
+                "pdf_updated": False,
+            }
+        else:
+            reply = (
+                f"I couldn't find any occurrences of "
+                f"{', '.join(repr(t) for t in direct_terms)} in the document. "
+                f"Check the exact spelling and try again."
+            )
+            job["chat_history"].append({"role": "user", "content": body.message})
+            job["chat_history"].append({"role": "assistant", "content": reply})
+            return {
+                "reply": reply,
+                "pages_referenced": [],
+                "redaction_request": None,
+                "pdf_updated": False,
+            }
 
     # ── Check RAG readiness ────────────────────────────────────────────
     if not job.get("rag_ready"):
