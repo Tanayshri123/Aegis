@@ -125,6 +125,33 @@ class TestLocateEntities(unittest.TestCase):
 
         self.assertIsNone(result[0].bbox)
 
+    def test_one_page_failure_doesnt_block_others(self):
+        """Test 3: If one page fails image conversion, other pages still get processed"""
+        entities = [
+            Entity(type="SSN", value="123-45-6789", page=1, bbox=None),
+            Entity(type="EMAIL", value="john@acme.com", page=2, bbox=None),
+        ]
+
+        def mock_convert_side_effect(pdf_path, page_num):
+            if page_num == 1:
+                raise Exception("Page 1 conversion failed")
+            return Path("/tmp/fake_page_2.jpg")
+
+        with patch("core.nemotron_parser.convert_page_to_image", side_effect=mock_convert_side_effect), \
+             patch("core.nemotron_parser.parse_page", new_callable=AsyncMock) as mock_parse:
+
+            mock_parse.return_value = [
+                {"text": "Email: john@acme.com", "bbox": [100, 110, 300, 130], "type": "text"},
+            ]
+
+            with patch.object(Path, "exists", return_value=False):
+                result = asyncio.run(locate_entities("/fake/doc.pdf", entities))
+
+        # Page 1 entity should have no bbox (conversion failed)
+        self.assertIsNone(result[0].bbox)
+        # Page 2 entity should have bbox (processed successfully)
+        self.assertEqual(result[1].bbox, [100, 110, 300, 130])
+
 
 class TestImageToBase64(unittest.TestCase):
     """Tests for image_to_base64() - MEDIUM priority"""
