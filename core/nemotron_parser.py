@@ -9,12 +9,14 @@ Supports two modes:
 2. Cloud (NVIDIA API) - Hosted Nemotron Parse service
 """
 
+import asyncio
 import base64
 import httpx
 import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -390,31 +392,59 @@ async def locate_entities(
     if not affected:
         return entities
 
-    # Cache parsed elements per page so that if multiple entities are on the same page we only call Nemotron Parse once per page, improving efficiency significantly
+    # Cache parsed elements per page so that if multiple entities are on the
+    # same page we only call Nemotron Parse once per page.
     page_elements = {}
+    img_paths = {}
 
-    for page_num in affected:
-        img_path = None
-        try:
-            # convert just this page to image
-            img_path = convert_page_to_image(pdf_path, page_num)
+    try:
+        # Phase 1: Convert all affected pages to images in parallel.
+        # convert_from_path is sync/CPU-bound (spawns poppler), so use threads.
+        loop = asyncio.get_event_loop()
+        workers = min(len(affected), os.cpu_count() or 4)
 
-            # sending to Nemotron Parse
-            elements = await parse_page(img_path, use_docker=use_docker, api_key=api_key)
-            page_elements[page_num] = elements
-            print(f"  Page {page_num}: Nemotron returned {len(elements)} text elements")
-            if elements:
-                print(f"  Sample element: {elements[0].get('text', '')[:80]!r}")
-            else:
-                print(f"  Warning: No elements parsed - check Nemotron response format")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                pn: loop.run_in_executor(executor, convert_page_to_image, pdf_path, pn)
+                for pn in affected
+            }
+            for pn in affected:
+                try:
+                    img_paths[pn] = await futures[pn]
+                except Exception as e:
+                    print(f"  Warning: Could not convert page {pn} to image: {e}")
+                    page_elements[pn] = []
 
-        except Exception as e:
-            print(f"  Warning: Could not parse page {page_num}: {e}")
-            page_elements[page_num] = []
+        # Phase 2: Send all page images to Nemotron Parse concurrently.
+        # Semaphore prevents overwhelming the API endpoint.
+        sem = asyncio.Semaphore(4 if use_docker else 8)
 
-        finally:
-            # Clean up temp image
-            if img_path and img_path.exists():
+        async def _parse_one(pn: int, img_path: Path):
+            async with sem:
+                try:
+                    elements = await parse_page(img_path, use_docker=use_docker, api_key=api_key)
+                    print(f"  Page {pn}: Nemotron returned {len(elements)} text elements")
+                    if elements:
+                        print(f"  Sample element: {elements[0].get('text', '')[:80]!r}")
+                    else:
+                        print(f"  Warning: No elements parsed - check Nemotron response format")
+                    return (pn, elements)
+                except Exception as e:
+                    print(f"  Warning: Could not parse page {pn}: {e}")
+                    return (pn, [])
+
+        parse_tasks = [
+            _parse_one(pn, img_paths[pn])
+            for pn in affected if pn in img_paths
+        ]
+        results = await asyncio.gather(*parse_tasks)
+        for pn, elements in results:
+            page_elements[pn] = elements
+
+    finally:
+        # Phase 3: Clean up all temp images
+        for img_path in img_paths.values():
+            if img_path and isinstance(img_path, Path) and img_path.exists():
                 img_path.unlink(missing_ok=True)
                 try:
                     img_path.parent.rmdir()

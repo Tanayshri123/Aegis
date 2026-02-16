@@ -316,39 +316,57 @@ def scan_document(pages: List[Dict], llm=None) -> List[Entity]:
 
     all_entities = []
 
-    for page in pages:
+    # Filter to non-empty pages
+    active_pages = [
+        p for p in pages
+        if p.get("text") and p["text"].strip()
+    ]
+    for p in pages:
+        if p not in active_pages:
+            print(f"  Page {p['page_number']}: empty, skipping")
+
+    # Regex scan: fast, runs inline for every page
+    for page in active_pages:
         page_num = page["page_number"]
         text = page["text"]
-
-        if not text or not text.strip():
-            print(f"  Page {page_num}: empty, skipping")
-            continue
-
         print(f"  Page {page_num}: scanning {len(text)} chars...")
 
-        # Regex scan (always runs, fast)
         t0 = time.time()
         regex_results = regex_scan(text, page_num)
         print(f"    [regex] {len(regex_results)} entities found  ({time.time()-t0:.2f}s)")
         for e in regex_results:
             print(f"      [{e.type}] {e.value!r}")
+        all_entities.extend(regex_results)
 
-        # LLM scan (runs if LLM available)
-        llm_results = []
-        if llm is not None:
-            llm_results = llm_scan(text, page_num, llm)
-            print(f"    [LLM]   {len(llm_results)} entities found")
-            for e in llm_results:
-                print(f"      [{e.type}] {e.value!r}")
-        else:
-            print(f"    [LLM]   skipped (no model)")
+    # LLM scan: parallelize across pages (each call is a blocking API round-trip)
+    if llm is not None and active_pages:
+        import concurrent.futures
+        workers = min(len(active_pages), 4)  # cap at 4 to avoid API rate limits
+        print(f"  [LLM] Scanning {len(active_pages)} page(s) in parallel ({workers} workers)...")
+        t0 = time.time()
 
-        # Combine and deduplicate for this page
-        page_entities = deduplicate_entities(regex_results + llm_results)
-        print(f"  Page {page_num}: {len(page_entities)} unique entities after deduplication")
-        all_entities.extend(page_entities)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            future_to_page = {
+                pool.submit(llm_scan, page["text"], page["page_number"], llm): page
+                for page in active_pages
+            }
+            for future in concurrent.futures.as_completed(future_to_page):
+                page = future_to_page[future]
+                page_num = page["page_number"]
+                try:
+                    llm_results = future.result()
+                    print(f"    [LLM] Page {page_num}: {len(llm_results)} entities found")
+                    for e in llm_results:
+                        print(f"      [{e.type}] {e.value!r}")
+                    all_entities.extend(llm_results)
+                except Exception as e:
+                    print(f"    [LLM] Page {page_num}: failed ({e})")
 
-    return all_entities
+        print(f"  [LLM] All pages done  ({time.time()-t0:.1f}s total)")
+    elif llm is None:
+        print(f"  [LLM] skipped (no model)")
+
+    return deduplicate_entities(all_entities)
 
 
 def find_custom_entities(pages: List[Dict], search_terms: List[str]) -> List[Entity]:
