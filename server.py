@@ -22,7 +22,7 @@ import traceback
 import uuid
 from importlib import import_module
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import fitz  # PyMuPDF
 import yaml
@@ -94,6 +94,292 @@ def _get_chat_prompt_template() -> str:
     return _chat_prompt_template
 
 
+# ── Broad vs. focused request detection ───────────────────────────────────
+
+# Signals that the user wants a sweeping/comprehensive action across the
+# entire document, not a focused lookup.  When detected, the chat endpoint
+# feeds the FULL document text to the LLM instead of the top-5 RAG chunks
+# so nothing gets missed.
+_BROAD_REQUEST_SIGNALS = [
+    "all ", "every ", "any ", "each ",
+    "all mentions", "every mention", "any mention",
+    "all references", "every reference", "any reference",
+    "all occurrences", "every occurrence", "any occurrence",
+    "everything", "everywhere", "across the document",
+    "throughout", "whole document", "entire document",
+]
+
+
+def _is_broad_request(message: str) -> bool:
+    """Return True if the message implies a document-wide sweep."""
+    msg_lower = message.lower()
+    return any(signal in msg_lower for signal in _BROAD_REQUEST_SIGNALS)
+
+
+# ── Category-based redaction detection ────────────────────────────────────
+
+# Maps natural-language PII category names to the entity type strings used
+# internally by pii_detector.  When a user says "redact all SSNs", we can
+# instantly filter the already-detected entity list by type — no LLM needed.
+_CATEGORY_ALIASES: Dict[str, List[str]] = {
+    "SSN": [
+        "ssn", "ssns", "social security", "social security number",
+        "social security numbers",
+    ],
+    "EIN": [
+        "ein", "eins", "employer identification", "employer id",
+        "employer ids", "federal ein", "federal id", "tax id", "tax ids",
+    ],
+    "EMAIL": [
+        "email", "emails", "email address", "email addresses",
+        "e-mail", "e-mails",
+    ],
+    "PHONE": [
+        "phone", "phones", "phone number", "phone numbers",
+        "telephone", "telephone number", "cell number",
+    ],
+    "CREDIT_CARD": [
+        "credit card", "credit cards", "card number", "card numbers",
+        "cc number",
+    ],
+    "NAME": [
+        "name", "names", "person name", "person names",
+        "employee name", "employee names", "personal name",
+        "full name", "full names",
+    ],
+    "EMPLOYER_NAME": [
+        "employer name", "employer names", "company name", "company names",
+        "employer", "employers", "company", "companies",
+        "business name", "organization", "organizations",
+    ],
+    "ADDRESS": [
+        "address", "addresses", "physical address", "mailing address",
+        "street address", "employer address", "employer addresses",
+        "employee address", "employee addresses", "home address",
+    ],
+    "DATE_OF_BIRTH": [
+        "date of birth", "dob", "birthday", "birthdate", "birth date",
+    ],
+    "ACCOUNT_NUMBER": [
+        "account number", "account numbers", "bank account",
+        "routing number", "account", "accounts",
+    ],
+    "STATE_ID": [
+        "state id", "state ids", "state identification",
+        "state employer id", "state employer ids",
+    ],
+    "CONTROL_NUMBER": [
+        "control number", "control numbers", "reference number",
+    ],
+}
+
+# Flatten to a lookup: alias_lower -> [entity_type, ...]
+_ALIAS_TO_TYPES: Dict[str, List[str]] = {}
+for _etype, _aliases in _CATEGORY_ALIASES.items():
+    for _alias in _aliases:
+        _ALIAS_TO_TYPES.setdefault(_alias, []).append(_etype)
+
+
+def _detect_category_redaction(message: str, entities: list) -> Optional[dict]:
+    """
+    Detect requests like "redact all SSNs" or "remove every phone number".
+
+    If the user is asking to redact an entire PII category, we resolve it
+    instantly from the already-detected entity list — no LLM round-trip.
+
+    Returns {"terms": [...], "pages": [...], "reply": "..."} or None.
+    """
+    msg_lower = message.lower()
+
+    # Must contain a redaction verb
+    redaction_verbs = [
+        "redact", "remove", "hide", "delete", "mask", "censor", "black out",
+        "block out", "take out", "get rid of", "cover", "erase", "wipe", "scrub",
+    ]
+    if not any(verb in msg_lower for verb in redaction_verbs):
+        return None
+
+    # Find which categories the user is referring to — match longest alias
+    # first to avoid "employer" shadowing "employer address".
+    matched_types = set()
+    sorted_aliases = sorted(_ALIAS_TO_TYPES.keys(), key=len, reverse=True)
+    for alias in sorted_aliases:
+        if alias in msg_lower:
+            matched_types.update(_ALIAS_TO_TYPES[alias])
+
+    if not matched_types:
+        return None
+
+    # Filter the already-detected entities by those types
+    matching = [e for e in entities if e["type"] in matched_types]
+
+    if not matching:
+        type_labels = ", ".join(sorted(matched_types))
+        return {
+            "terms": [],
+            "pages": [],
+            "reply": (
+                f"No {type_labels} entities were detected in this document during "
+                f"the initial scan. If you believe some were missed, try describing "
+                f"the specific value you see (e.g. 'redact 555-1234')."
+            ),
+        }
+
+    terms = sorted(set(e["value"] for e in matching))
+    pages = sorted(set(e["page"] for e in matching))
+    type_labels = ", ".join(sorted(matched_types))
+    count = len(matching)
+
+    reply = (
+        f"Found {count} {type_labels} entit{'y' if count == 1 else 'ies'} "
+        f"across page(s) {', '.join(str(p) for p in pages)}: "
+        f"{', '.join(repr(t) for t in terms[:10])}"
+        f"{'...' if len(terms) > 10 else ''}. "
+        f"Click Confirm below to redact."
+    )
+
+    return {"terms": terms, "pages": pages, "reply": reply}
+
+
+# ── Page-scoped request detection ─────────────────────────────────────────
+
+
+def _detect_page_scope(message: str) -> Optional[List[int]]:
+    """
+    Detect when the user is asking about or targeting specific pages.
+
+    Handles:
+      - "what's on page 3"
+      - "redact everything on page 1 and 2"
+      - "pages 1, 2, and 3"
+      - "pages 1-3", "pages 1 through 5"
+      - "on page 1"
+
+    Returns list of 1-indexed page numbers, or None if no page scope detected.
+    """
+    msg_lower = message.lower()
+
+    # Only trigger if the message mentions "page" at all
+    if "page" not in msg_lower:
+        return None
+
+    page_nums: List[int] = []
+
+    # Step 1: expand ranges — "1-3", "1 through 3", "1 to 3"
+    expanded = re.sub(
+        r'(\d+)\s*(?:-|through|to)\s*(\d+)',
+        lambda m: " ".join(str(n) for n in range(int(m.group(1)), int(m.group(2)) + 1)),
+        msg_lower,
+    )
+
+    # Step 2: grab every number that follows "page" or "pages" anywhere
+    # in the sentence (possibly separated by commas, "and", spaces)
+    # Strategy: find "page(s)" then collect all nearby numbers
+    for m in re.finditer(r'pages?\s+', expanded):
+        # From the end of "page(s) ", consume the number-list tail
+        tail = expanded[m.end():]
+        # Collect digits from a run of "number + separator" tokens
+        for token in re.split(r'[^0-9]+', tail):
+            if token.isdigit():
+                page_nums.append(int(token))
+            elif token == "":
+                continue
+            else:
+                break  # hit a non-number, non-separator token
+
+    return sorted(set(page_nums)) if page_nums else None
+
+
+# ── Remaining / audit request detection ───────────────────────────────────
+
+_AUDIT_SIGNALS = [
+    "what's left", "whats left", "what is left",
+    "what's still", "whats still", "what is still",
+    "what's remaining", "whats remaining", "what remains",
+    "still visible", "still showing", "still there",
+    "what did you miss", "what was missed", "anything missed",
+    "what hasn't been", "what hasnt been", "what has not been",
+    "still unredacted", "not redacted", "not yet redacted",
+    "remaining pii", "remaining sensitive", "leftover",
+    "did you get everything", "did you catch everything",
+    "how thorough", "how complete", "coverage",
+    "redaction summary", "what was redacted",
+    "what did you redact", "show me what", "list what",
+]
+
+
+def _is_audit_request(message: str) -> bool:
+    """Return True if the user is asking about redaction coverage/completeness."""
+    msg_lower = message.lower()
+    return any(signal in msg_lower for signal in _AUDIT_SIGNALS)
+
+
+def _build_audit_reply(job: dict) -> dict:
+    """
+    Build a summary of what has been redacted and what might remain.
+
+    Looks at the entity list and groups by type/page so the user can
+    quickly assess coverage.
+    """
+    entities = job.get("entities", [])
+    pages_data = job.get("pages", [])
+
+    if not entities:
+        return {
+            "reply": (
+                "No entities have been redacted yet. The initial scan didn't "
+                "find any PII, or redaction hasn't been applied. You can ask "
+                "me to look for specific items (e.g. 'are there any phone "
+                "numbers on page 2?')."
+            ),
+            "pages_referenced": [],
+            "redaction_request": None,
+            "pdf_updated": False,
+        }
+
+    # Group by type
+    by_type: Dict[str, list] = {}
+    for e in entities:
+        by_type.setdefault(e["type"], []).append(e)
+
+    lines = ["**Redaction summary:**\n"]
+    all_pages = set()
+    for etype, ents in sorted(by_type.items()):
+        values = sorted(set(e["value"] for e in ents))
+        pages = sorted(set(e["page"] for e in ents))
+        all_pages.update(pages)
+        preview = ", ".join(repr(v) for v in values[:5])
+        if len(values) > 5:
+            preview += f"... (+{len(values) - 5} more)"
+        lines.append(f"- **{etype}** ({len(ents)} occurrence(s)): {preview}")
+
+    total_pages = len(pages_data)
+    covered_pages = sorted(all_pages)
+    uncovered = sorted(set(range(1, total_pages + 1)) - all_pages)
+
+    lines.append(f"\n**Pages with redactions:** {', '.join(str(p) for p in covered_pages)}")
+    if uncovered:
+        lines.append(
+            f"**Pages with no redactions:** {', '.join(str(p) for p in uncovered)} "
+            f"— these may have no PII, or the initial scan may have missed something. "
+            f"Ask me to check a specific page if you're unsure."
+        )
+    else:
+        lines.append("**All pages** have at least one redaction applied.")
+
+    lines.append(
+        f"\nTotal: **{len(entities)} redaction(s)** across "
+        f"**{len(covered_pages)}/{total_pages} page(s)**."
+    )
+
+    return {
+        "reply": "\n".join(lines),
+        "pages_referenced": covered_pages,
+        "redaction_request": None,
+        "pdf_updated": False,
+    }
+
+
 # ── Direct redaction request detection ────────────────────────────────────
 
 
@@ -117,6 +403,7 @@ def _detect_direct_redaction_request(message: str) -> Optional[list]:
     redaction_verbs = [
         "redact", "remove", "hide", "delete", "mask", "censor", "black out",
         "block out", "take out", "get rid of",
+        "cover up", "cover", "blank out", "obscure", "scrub", "erase", "wipe",
     ]
     if not any(verb in msg_lower for verb in redaction_verbs):
         return None
@@ -146,7 +433,28 @@ def _detect_direct_redaction_request(message: str) -> Optional[list]:
                         terms.append(part)
                 break
 
-    return terms if terms else None
+    if not terms:
+        return None
+
+    # If the extracted terms look like natural language instructions rather
+    # than actual document values, fall through to the LLM path which has
+    # document context and can resolve descriptions like "the state income
+    # tax" to actual values like "6612.65".
+    instruction_signals = [
+        "any", "every", "all", "specifically", "only", "especially",
+        "its ", "their ", "the amount", "the value", "the number",
+        "please", "i think", "i noticed", "i see", "i found",
+        "on page", "from page", "on the", "from the",
+        "figure", "should", "shouldn't", "needs to", "need to",
+    ]
+    for term in terms:
+        term_lower = term.lower()
+        # If the term contains instruction-like language, it's probably
+        # a description, not a literal value to search for.
+        if any(signal in term_lower for signal in instruction_signals):
+            return None
+
+    return terms
 
 
 # ── Redaction intent parsing ───────────────────────────────────────────────
@@ -440,6 +748,42 @@ async def chat_endpoint(job_id: str, body: ChatRequest):
         result = await _execute_chat_redaction(job_id, body.confirmed_terms)
         return result
 
+    # ── Audit / "what's left?" request ───────────────────────────────
+    if _is_audit_request(body.message):
+        result = _build_audit_reply(job)
+        job["chat_history"].append({"role": "user", "content": body.message})
+        job["chat_history"].append({"role": "assistant", "content": result["reply"]})
+        return result
+
+    # ── Category-based redaction ("redact all SSNs") ──────────────────
+    # Resolves instantly from the already-detected entity list — no LLM.
+    category_result = _detect_category_redaction(
+        body.message, job.get("entities", [])
+    )
+    if category_result is not None:
+        reply = category_result["reply"]
+        terms = category_result["terms"]
+        pages = category_result["pages"]
+        job["chat_history"].append({"role": "user", "content": body.message})
+        job["chat_history"].append({"role": "assistant", "content": reply})
+
+        if terms:
+            job["pending_redaction"] = {"terms": terms}
+            return {
+                "reply": reply,
+                "pages_referenced": pages,
+                "redaction_request": {"terms": terms, "pages": pages},
+                "pdf_updated": False,
+            }
+        else:
+            # No matching entities found for that category
+            return {
+                "reply": reply,
+                "pages_referenced": [],
+                "redaction_request": None,
+                "pdf_updated": False,
+            }
+
     # ── Direct redaction request (bypass LLM entirely) ──────────────
     direct_terms = _detect_direct_redaction_request(body.message)
     if direct_terms:
@@ -519,10 +863,39 @@ async def chat_endpoint(job_id: str, body: ChatRequest):
     rag_engine = job["rag_engine"]
     llm = _get_chat_llm()
 
-    # Retrieve relevant document chunks
-    chunks = rag_engine.retrieve_context(body.message, top_k=5)
-    context_text = rag_engine.format_context_for_llm(chunks, include_scores=False)
-    pages_referenced = sorted(set(c["page_number"] for c in chunks))
+    # Determine context strategy:
+    #   1. Page-scoped  — user targets specific pages ("on page 2")
+    #   2. Broad        — sweeping request ("all", "every") → full document
+    #   3. Focused      — normal question → RAG top-5
+    page_scope = _detect_page_scope(body.message)
+    broad = _is_broad_request(body.message)
+    pages_data = job.get("pages", [])
+    context_text = ""
+    pages_referenced = []
+
+    if page_scope:
+        scoped = [p for p in pages_data if p["page_number"] in page_scope]
+        if scoped:
+            context_text = "\n\n".join(
+                f"[Page {p['page_number']}]\n{p['text']}" for p in scoped
+            )
+            pages_referenced = sorted(p["page_number"] for p in scoped)
+            print(f"  [chat] Page-scoped request — sending page(s) {page_scope}")
+        else:
+            # Requested pages don't exist; fall through to broad/RAG
+            page_scope = None
+
+    if not page_scope and broad:
+        context_text = "\n\n".join(
+            f"[Page {p['page_number']}]\n{p['text']}" for p in pages_data
+        )
+        pages_referenced = sorted(p["page_number"] for p in pages_data)
+        print(f"  [chat] Broad request detected — sending full document ({len(pages_data)} pages)")
+
+    if not page_scope and not broad:
+        chunks = rag_engine.retrieve_context(body.message, top_k=5)
+        context_text = rag_engine.format_context_for_llm(chunks, include_scores=False)
+        pages_referenced = sorted(set(c["page_number"] for c in chunks))
 
     # Format entity list for the prompt
     entities_text = "\n".join(

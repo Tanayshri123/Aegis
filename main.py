@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import os
+import threading
 import time
 from importlib import import_module
 
@@ -17,6 +18,22 @@ from core.pdf_processor import extract_text_from_pdf
 from core.pii_detector import scan_document
 from core.nemotron_parser import locate_entities
 from core.redactor import redact_pdf
+
+# ── Cached LLM instance (avoids re-validating against NVIDIA /models API) ──
+_cached_pipeline_llm = None
+_pipeline_llm_lock = threading.Lock()
+LLM_LOAD_TIMEOUT = 60
+
+
+def _get_pipeline_llm():
+    """Get or create the cached pipeline LLM (temperature=0, deterministic)."""
+    global _cached_pipeline_llm
+    if _cached_pipeline_llm is None:
+        with _pipeline_llm_lock:
+            if _cached_pipeline_llm is None:
+                llm_utils = import_module("llm-utils")
+                _cached_pipeline_llm = llm_utils.get_model()
+    return _cached_pipeline_llm
 
 
 async def process_pdf(pdf_path: str, use_docker: bool = True, return_entities: bool = False,
@@ -81,16 +98,10 @@ async def process_pdf(pdf_path: str, use_docker: bool = True, return_entities: b
     print(f"\n[2/4] Detecting PII...")
     _progress(2, "Detecting PII (regex + LLM)...")
     llm = None
-    # ChatNVIDIA constructor calls NVIDIA's /models API to validate the model,
-    # which can hang if the network is slow. Load in a thread with a 60s timeout.
-    # 60s (up from 30s) because a slow API handshake was causing spurious timeouts
-    # on good connections, silently stripping all NAME/ADDRESS detection.
-    LLM_LOAD_TIMEOUT = 60
     try:
         print(f"  Loading LLM (nvidia/llama-3.3-nemotron-super-49b-v1.5)... ", end="", flush=True)
-        llm_utils = import_module("llm-utils")
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(llm_utils.get_model)
+            future = pool.submit(_get_pipeline_llm)
             llm = future.result(timeout=LLM_LOAD_TIMEOUT)
         print(f"ready  ({time.time()-t0:.1f}s)")
         print(f"  Using LLM + regex detection.")
