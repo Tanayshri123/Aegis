@@ -24,6 +24,9 @@ function App() {
   // Comparison modal
   const [showCompare, setShowCompare] = useState(false);
 
+  // Redaction details modal
+  const [showRedactionDetails, setShowRedactionDetails] = useState(false);
+
   // Chat state
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
@@ -31,6 +34,12 @@ function App() {
   const [pendingRedaction, setPendingRedaction] = useState(null);
   const [pageRefreshKey, setPageRefreshKey] = useState(0);
   const chatEndRef = useRef(null);
+
+  // Suggestion chips visibility
+  const [showSuggestions, setShowSuggestions] = useState(true);
+
+  // Undo tracking
+  const [redactionHistoryCount, setRedactionHistoryCount] = useState(0);
 
   const stopPolling = () => {
     if (pollRef.current) {
@@ -126,6 +135,7 @@ function App() {
     setPageCount(0);
     setEntities([]);
     setShowCompare(false);
+    setShowRedactionDetails(false);
     setPipelineStep(0);
     setStepDetail('');
     setChatMessages([]);
@@ -133,6 +143,8 @@ function App() {
     setChatLoading(false);
     setPendingRedaction(null);
     setPageRefreshKey(0);
+    setShowSuggestions(true);
+    setRedactionHistoryCount(0);
   };
 
   const onDragOver = useCallback((e) => {
@@ -184,11 +196,12 @@ function App() {
     }
   }, [chatMessages, chatLoading]);
 
-  const sendChatMessage = async () => {
-    if (!chatInput.trim() || chatLoading) return;
+  const sendChatMessage = async (messageOverride) => {
+    const userMessage = (messageOverride || chatInput).trim();
+    if (!userMessage || chatLoading) return;
 
-    const userMessage = chatInput.trim();
-    setChatInput('');
+    if (!messageOverride) setChatInput('');
+    setShowSuggestions(false);
     setChatMessages(prev => [...prev, { role: 'user', content: userMessage }]);
     setChatLoading(true);
 
@@ -200,7 +213,13 @@ function App() {
       });
 
       const data = await res.json();
-      setChatMessages(prev => [...prev, { role: 'assistant', content: data.reply }]);
+
+      const newMsg = { role: 'assistant', content: data.reply };
+      if (data.pdf_updated) {
+        newMsg.isRedaction = true;
+      }
+
+      setChatMessages(prev => [...prev, newMsg]);
 
       if (data.redaction_request) {
         setPendingRedaction(data.redaction_request);
@@ -208,6 +227,7 @@ function App() {
 
       if (data.pdf_updated) {
         setPageRefreshKey(prev => prev + 1);
+        setRedactionHistoryCount(prev => prev + 1);
         // Re-fetch entities from progress endpoint
         const progRes = await fetch(`/api/v1/jobs/${jobId}/progress`);
         if (progRes.ok) {
@@ -245,10 +265,16 @@ function App() {
       });
 
       const data = await res.json();
-      setChatMessages(prev => [...prev, { role: 'assistant', content: data.reply }]);
+
+      const newMsg = { role: 'assistant', content: data.reply };
+      if (data.pdf_updated) {
+        newMsg.isRedaction = true;
+      }
+      setChatMessages(prev => [...prev, newMsg]);
 
       if (data.pdf_updated) {
         setPageRefreshKey(prev => prev + 1);
+        setRedactionHistoryCount(prev => prev + 1);
         const progRes = await fetch(`/api/v1/jobs/${jobId}/progress`);
         if (progRes.ok) {
           const progData = await progRes.json();
@@ -280,6 +306,50 @@ function App() {
       sendChatMessage();
     }
   };
+
+  const handleUndo = async (msgIndex) => {
+    if (chatLoading) return;
+    setChatLoading(true);
+
+    try {
+      const res = await fetch(`/api/v1/jobs/${jobId}/undo`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Undo failed');
+      }
+
+      const data = await res.json();
+      setEntities(data.entities || []);
+      setPageCount(data.page_count);
+      setPageRefreshKey(prev => prev + 1);
+      setRedactionHistoryCount(prev => Math.max(0, prev - 1));
+
+      // Mark the redaction message as undone and add a system message
+      setChatMessages(prev => {
+        const updated = [...prev];
+        if (updated[msgIndex]) {
+          updated[msgIndex] = { ...updated[msgIndex], isRedaction: false, undone: true };
+        }
+        updated.push({ role: 'assistant', content: 'Redaction undone successfully.' });
+        return updated;
+      });
+    } catch (err) {
+      setChatMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `Undo failed: ${err.message}`
+      }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  // Find the index of the last redaction message (for showing undo button)
+  const lastRedactionIndex = (() => {
+    for (let i = chatMessages.length - 1; i >= 0; i--) {
+      if (chatMessages[i].isRedaction) return i;
+    }
+    return -1;
+  })();
 
   const renderLeftPane = () => {
     // After redaction success: show actual redacted PDF pages (with cache-busting)
@@ -372,6 +442,50 @@ function App() {
     );
   };
 
+  const renderRedactionDetailsModal = () => {
+    if (!showRedactionDetails) return null;
+
+    // Group entities by type
+    const grouped = {};
+    for (const e of entities) {
+      if (!grouped[e.type]) grouped[e.type] = [];
+      grouped[e.type].push(e);
+    }
+
+    return (
+      <div className="modal-overlay" onClick={() => setShowRedactionDetails(false)}>
+        <div className="modal-content redaction-details-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-header">
+            <h2>Redactions Made</h2>
+            <button className="modal-close" onClick={() => setShowRedactionDetails(false)}>&times;</button>
+          </div>
+          <div className="redaction-details-body">
+            {Object.keys(grouped).length === 0 ? (
+              <p className="no-redactions">No redactions have been applied yet.</p>
+            ) : (
+              Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([type, ents]) => (
+                <div key={type} className="redaction-type-group">
+                  <div className="redaction-type-header">
+                    <span className="redaction-type-badge">{type.replace(/_/g, ' ')}</span>
+                    <span className="redaction-type-count">{ents.length} instance{ents.length !== 1 ? 's' : ''}</span>
+                  </div>
+                  <ul className="redaction-instances">
+                    {ents.map((e, idx) => (
+                      <li key={idx} className="redaction-instance">
+                        <span className="redaction-value">"{e.value}"</span>
+                        <span className="redaction-page">page {e.page}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   const renderProgressTracker = () => {
     const steps = [
       { num: 1, label: "Extract Text" },
@@ -380,28 +494,45 @@ function App() {
       { num: 4, label: "Redact PDF" },
     ];
 
+    // Progress bar percentage
+    const progressPercent = Math.min(100, (pipelineStep / 4) * 100);
+
     return (
-      <div className="progress-tracker">
-        {steps.map((s) => {
-          let cls = "progress-step";
-          if (pipelineStep > s.num) cls += " completed";
-          else if (pipelineStep === s.num) cls += " active";
-          return (
-            <div key={s.num} className={cls}>
-              <div className="step-indicator">
-                {pipelineStep > s.num ? (
-                  <span className="step-check">&#10003;</span>
-                ) : (
-                  <span className="step-num">{s.num}</span>
-                )}
+      <>
+        <div className="progress-tracker">
+          {steps.map((s) => {
+            let cls = "progress-step";
+            if (pipelineStep > s.num) cls += " completed";
+            else if (pipelineStep === s.num) cls += " active";
+            return (
+              <div key={s.num} className={cls}>
+                <div className="step-indicator">
+                  {pipelineStep > s.num ? (
+                    <span className="step-check">&#10003;</span>
+                  ) : (
+                    <span className="step-num">{s.num}</span>
+                  )}
+                </div>
+                <span className="step-label">{s.label}</span>
               </div>
-              <span className="step-label">{s.label}</span>
-            </div>
-          );
-        })}
-      </div>
+            );
+          })}
+        </div>
+        <div className="progress-bar-container">
+          <div className="progress-bar-fill" style={{ width: `${progressPercent}%` }}></div>
+        </div>
+      </>
     );
   };
+
+  const suggestionChips = [
+    { label: "What's left?", message: "What's left to redact?" },
+    { label: "Redact SSNs", message: "Redact all SSNs" },
+    { label: "Redact names", message: "Redact all names" },
+    { label: "Redact addresses", message: "Redact all addresses" },
+    { label: "Redaction summary", message: "Show me what was redacted" },
+    { label: "Page 1 info", message: "What's on page 1?" },
+  ];
 
   const renderContent = () => {
     switch (status) {
@@ -427,13 +558,14 @@ function App() {
           <div className="split-layout">
             {renderLeftPane()}
             <div className="right-pane right-pane-chat">
-              {/* Compact summary bar */}
+              {/* Compact summary bar - sticky */}
               <div className="summary-bar">
-                <div className="summary-info">
+                <div className="summary-info" onClick={() => setShowRedactionDetails(true)} title="Click to view redaction details">
                   <span className="summary-check">&#10003;</span>
                   <span className="summary-text">
                     Redacted {entities.length} entit{entities.length === 1 ? 'y' : 'ies'}
                   </span>
+                  <span className="summary-expand-icon">&#9662;</span>
                 </div>
                 <div className="summary-actions">
                   <a
@@ -456,8 +588,21 @@ function App() {
               <div className="chat-container">
                 <div className="chat-messages">
                   {chatMessages.map((msg, idx) => (
-                    <div key={idx} className={`chat-message ${msg.role}`}>
-                      {msg.content}
+                    <div key={idx} className={`chat-message ${msg.role}${msg.undone ? ' undone' : ''}`}>
+                      <span>{msg.content}</span>
+                      {msg.isRedaction && idx === lastRedactionIndex && redactionHistoryCount > 0 && (
+                        <button
+                          className="undo-btn"
+                          onClick={() => handleUndo(idx)}
+                          disabled={chatLoading}
+                          title="Undo this redaction"
+                        >
+                          &#x21A9; Undo
+                        </button>
+                      )}
+                      {msg.undone && (
+                        <span className="undone-badge">Undone</span>
+                      )}
                     </div>
                   ))}
 
@@ -488,6 +633,27 @@ function App() {
                   <div ref={chatEndRef} />
                 </div>
 
+                {/* Suggestion chips + info blurb */}
+                {showSuggestions && chatMessages.length <= 1 && (
+                  <div className="suggestions-area">
+                    <div className="suggestions-info">
+                      Try asking me to redact specific terms, entire PII categories, or explore document contents.
+                    </div>
+                    <div className="suggestions-chips">
+                      {suggestionChips.map((chip, idx) => (
+                        <button
+                          key={idx}
+                          className="suggestion-chip"
+                          onClick={() => sendChatMessage(chip.message)}
+                          disabled={chatLoading}
+                        >
+                          {chip.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <div className="chat-input-bar">
                   <input
                     type="text"
@@ -500,7 +666,7 @@ function App() {
                   />
                   <button
                     className="chat-send-btn"
-                    onClick={sendChatMessage}
+                    onClick={() => sendChatMessage()}
                     disabled={chatLoading || !chatInput.trim()}
                   >
                     &#x27A4;
@@ -570,6 +736,7 @@ function App() {
         {renderContent()}
       </main>
       {renderCompareModal()}
+      {renderRedactionDetailsModal()}
     </div>
   );
 }

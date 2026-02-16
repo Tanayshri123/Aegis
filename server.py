@@ -563,6 +563,7 @@ def _run_pipeline_thread(job_id: str, upload_path: str):
             "chat_history": [],
             "chat_redacting": False,
             "pending_redaction": None,
+            "redaction_history": [],  # stack of previous states for undo
         })
 
         # Build RAG knowledge base for chat (uses original extracted text)
@@ -962,6 +963,34 @@ async def chat_endpoint(job_id: str, body: ChatRequest):
     }
 
 
+@app.post("/api/v1/jobs/{job_id}/undo")
+async def undo_redaction(job_id: str):
+    """
+    Undo the most recent chat-driven redaction.
+
+    Restores the previous redacted PDF, entity list, and page count
+    from the redaction history stack.
+    """
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    history = job.get("redaction_history", [])
+    if not history:
+        raise HTTPException(status_code=400, detail="Nothing to undo")
+
+    prev = history.pop()
+    job["redacted_path"] = prev["redacted_path"]
+    job["entities"] = prev["entities"]
+    job["page_count"] = prev["page_count"]
+
+    return {
+        "success": True,
+        "entities": prev["entities"],
+        "page_count": prev["page_count"],
+    }
+
+
 def _normalize_for_match(text: str) -> str:
     """Strip all dashes, hyphens (ASCII + unicode), spaces, and punctuation for fuzzy comparison."""
     return re.sub(r'[-\s.,()\/\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]+', '', text).lower()
@@ -1047,6 +1076,13 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
     job = _jobs[job_id]
     job["chat_redacting"] = True
 
+    # Save current state for undo
+    job.setdefault("redaction_history", []).append({
+        "redacted_path": job["redacted_path"],
+        "entities": list(job["entities"]),
+        "page_count": job["page_count"],
+    })
+
     try:
         from core.pii_detector import find_custom_entities
         from core.nemotron_parser import locate_entities
@@ -1059,6 +1095,9 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
 
         if not new_entities:
             job["chat_redacting"] = False
+            # No redaction applied — remove the undo snapshot
+            if job.get("redaction_history"):
+                job["redaction_history"].pop()
             reply = (
                 f"I couldn't find any occurrences of {', '.join(repr(t) for t in terms)} "
                 "in the document. Could you check the exact spelling?"
@@ -1156,6 +1195,9 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
 
         if not entities_with_bbox and not used_fitz_fallback:
             job["chat_redacting"] = False
+            # No redaction applied — remove the undo snapshot
+            if job.get("redaction_history"):
+                job["redaction_history"].pop()
             reply = (
                 f"Found text matching {', '.join(repr(t) for t in terms)} but couldn't "
                 "determine exact positions for redaction. Try more specific terms."
@@ -1205,6 +1247,9 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
 
     except Exception as e:
         traceback.print_exc()
+        # Redaction failed — remove the undo snapshot
+        if job.get("redaction_history"):
+            job["redaction_history"].pop()
         reply = f"Redaction failed: {e}"
         job["chat_history"].append({"role": "assistant", "content": reply})
         return {

@@ -231,6 +231,7 @@ body {
   padding: 2rem;
   position: relative;
   overflow: hidden;
+  height: 100%;
 }
 
 .document-anim-container {
@@ -289,6 +290,7 @@ body {
   max-width: 600px;
   border-radius: 4px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  flex-shrink: 0;
 }
 
 /* Right Pane: Status & Results */
@@ -301,6 +303,8 @@ body {
   text-align: center;
   position: relative;
   background-color: var(--color-surface);
+  height: 100%;
+  overflow: hidden;
 }
 
 /* Quirky Text & Mini Bubbles */
@@ -424,6 +428,46 @@ body {
   font-size: 0.95rem;
   margin-top: 1rem;
   font-weight: 500;
+}
+
+/* --- Progress Bar --- */
+.progress-bar-container {
+  width: 80%;
+  max-width: 300px;
+  height: 6px;
+  background-color: var(--color-border);
+  border-radius: 3px;
+  margin: 0.75rem auto 0;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--color-accent), var(--color-success));
+  border-radius: 3px;
+  transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+  position: relative;
+}
+
+.progress-bar-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255,255,255,0.3) 50%,
+    transparent 100%
+  );
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
 }
 
 /* Result View */
@@ -638,6 +682,93 @@ body {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
 }
 
+/* --- Redaction Details Modal --- */
+.redaction-details-modal {
+  width: 560px;
+  max-width: 92vw;
+  height: auto;
+  max-height: 80vh;
+}
+
+.redaction-details-body {
+  padding: 1.5rem 2rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.no-redactions {
+  color: var(--color-text-muted);
+  font-style: italic;
+  text-align: center;
+  padding: 2rem 0;
+}
+
+.redaction-type-group {
+  margin-bottom: 1.25rem;
+}
+
+.redaction-type-group:last-child {
+  margin-bottom: 0;
+}
+
+.redaction-type-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.redaction-type-badge {
+  font-family: var(--font-display);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--color-accent);
+  background-color: var(--color-accent-light);
+  padding: 0.25rem 0.75rem;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.redaction-type-count {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  font-weight: 500;
+}
+
+.redaction-instances {
+  list-style: none;
+  padding-left: 1rem;
+  border-left: 2px solid var(--color-border);
+}
+
+.redaction-instance {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.85rem;
+  border-radius: 6px;
+  transition: background-color 0.1s ease;
+}
+
+.redaction-instance:hover {
+  background-color: #f8f9fa;
+}
+
+.redaction-value {
+  color: var(--color-text);
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 0.82rem;
+}
+
+.redaction-page {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+  margin-left: 1rem;
+}
+
 /* --- Chat Panel (Success State Right Pane) --- */
 .right-pane-chat {
   padding: 0;
@@ -646,7 +777,7 @@ body {
   text-align: left;
 }
 
-/* Summary Bar (compact top strip) */
+/* Summary Bar (compact top strip) - sticky at top */
 .summary-bar {
   display: flex;
   align-items: center;
@@ -656,12 +787,21 @@ body {
   background-color: var(--color-surface);
   flex-shrink: 0;
   gap: 0.75rem;
+  z-index: 5;
 }
 
 .summary-info {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  cursor: pointer;
+  padding: 0.2rem 0.5rem;
+  border-radius: 8px;
+  transition: background-color 0.15s ease;
+}
+
+.summary-info:hover {
+  background-color: #f1f3f5;
 }
 
 .summary-check {
@@ -686,6 +826,16 @@ body {
   white-space: nowrap;
 }
 
+.summary-expand-icon {
+  font-size: 0.7rem;
+  color: var(--color-text-muted);
+  transition: transform 0.15s ease;
+}
+
+.summary-info:hover .summary-expand-icon {
+  transform: translateY(1px);
+}
+
 .summary-actions {
   display: flex;
   gap: 0.5rem;
@@ -704,6 +854,7 @@ body {
   flex-direction: column;
   flex: 1;
   overflow: hidden;
+  min-height: 0;
 }
 
 .chat-messages {
@@ -713,6 +864,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+  min-height: 0;
 }
 
 .chat-message {
@@ -737,6 +889,51 @@ body {
   background-color: #f1f3f5;
   color: var(--color-text);
   border-bottom-left-radius: 4px;
+}
+
+.chat-message.undone {
+  opacity: 0.5;
+  text-decoration: line-through;
+}
+
+/* Undo button on redaction messages */
+.undo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.6rem;
+  font-size: 0.75rem;
+  font-family: var(--font-body);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  background: white;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.undo-btn:hover:not(:disabled) {
+  color: var(--color-error);
+  border-color: var(--color-error);
+  background-color: #fff5f5;
+}
+
+.undo-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.undone-badge {
+  display: inline-block;
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  background-color: #f1f3f5;
+  padding: 0.15rem 0.5rem;
+  border-radius: 8px;
 }
 
 /* Typing dots animation */
@@ -783,6 +980,56 @@ body {
 .chat-confirm-actions {
   display: flex;
   gap: 0.5rem;
+}
+
+/* --- Suggestion Chips --- */
+.suggestions-area {
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--color-border);
+  background-color: #fafbfc;
+  flex-shrink: 0;
+}
+
+.suggestions-info {
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+  margin-bottom: 0.6rem;
+  line-height: 1.4;
+  padding: 0.4rem 0.6rem;
+  background-color: var(--color-accent-light);
+  border-radius: 8px;
+  border-left: 3px solid var(--color-accent);
+}
+
+.suggestions-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.suggestion-chip {
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.35rem 0.75rem;
+  border-radius: 16px;
+  border: 1px solid var(--color-border);
+  background-color: white;
+  color: var(--color-text);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.suggestion-chip:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background-color: var(--color-accent-light);
+}
+
+.suggestion-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Chat Input Bar */
