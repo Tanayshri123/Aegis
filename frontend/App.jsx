@@ -38,8 +38,9 @@ function App() {
   // Suggestion chips visibility
   const [showSuggestions, setShowSuggestions] = useState(true);
 
-  // Undo tracking
+  // Undo/redo tracking
   const [redactionHistoryCount, setRedactionHistoryCount] = useState(0);
+  const [redoAvailable, setRedoAvailable] = useState(false);
 
   const stopPolling = () => {
     if (pollRef.current) {
@@ -145,6 +146,7 @@ function App() {
     setPageRefreshKey(0);
     setShowSuggestions(true);
     setRedactionHistoryCount(0);
+    setRedoAvailable(false);
   };
 
   const onDragOver = useCallback((e) => {
@@ -228,6 +230,7 @@ function App() {
       if (data.pdf_updated) {
         setPageRefreshKey(prev => prev + 1);
         setRedactionHistoryCount(prev => prev + 1);
+        setRedoAvailable(false);
         // Re-fetch entities from progress endpoint
         const progRes = await fetch(`/api/v1/jobs/${jobId}/progress`);
         if (progRes.ok) {
@@ -275,6 +278,7 @@ function App() {
       if (data.pdf_updated) {
         setPageRefreshKey(prev => prev + 1);
         setRedactionHistoryCount(prev => prev + 1);
+        setRedoAvailable(false);
         const progRes = await fetch(`/api/v1/jobs/${jobId}/progress`);
         if (progRes.ok) {
           const progData = await progRes.json();
@@ -323,14 +327,15 @@ function App() {
       setPageCount(data.page_count);
       setPageRefreshKey(prev => prev + 1);
       setRedactionHistoryCount(prev => Math.max(0, prev - 1));
+      setRedoAvailable(true);
 
-      // Mark the redaction message as undone and add a system message
+      // Mark the redaction message as undone
       setChatMessages(prev => {
         const updated = [...prev];
         if (updated[msgIndex]) {
           updated[msgIndex] = { ...updated[msgIndex], isRedaction: false, undone: true };
         }
-        updated.push({ role: 'assistant', content: 'Redaction undone successfully.' });
+        updated.push({ role: 'assistant', content: 'Redaction undone. Click Redo to re-apply.' });
         return updated;
       });
     } catch (err) {
@@ -343,10 +348,55 @@ function App() {
     }
   };
 
+  const handleRedo = async (msgIndex) => {
+    if (chatLoading) return;
+    setChatLoading(true);
+
+    try {
+      const res = await fetch(`/api/v1/jobs/${jobId}/redo`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Redo failed');
+      }
+
+      const data = await res.json();
+      setEntities(data.entities || []);
+      setPageCount(data.page_count);
+      setPageRefreshKey(prev => prev + 1);
+      setRedactionHistoryCount(prev => prev + 1);
+      setRedoAvailable(false);
+
+      // Restore the redaction message
+      setChatMessages(prev => {
+        const updated = [...prev];
+        if (updated[msgIndex]) {
+          updated[msgIndex] = { ...updated[msgIndex], isRedaction: true, undone: false };
+        }
+        updated.push({ role: 'assistant', content: 'Redaction re-applied.' });
+        return updated;
+      });
+    } catch (err) {
+      setChatMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `Redo failed: ${err.message}`
+      }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
   // Find the index of the last redaction message (for showing undo button)
   const lastRedactionIndex = (() => {
     for (let i = chatMessages.length - 1; i >= 0; i--) {
       if (chatMessages[i].isRedaction) return i;
+    }
+    return -1;
+  })();
+
+  // Find the last undone message (for showing redo button)
+  const lastUndoneIndex = (() => {
+    for (let i = chatMessages.length - 1; i >= 0; i--) {
+      if (chatMessages[i].undone) return i;
     }
     return -1;
   })();
@@ -558,6 +608,11 @@ function App() {
           <div className="split-layout">
             {renderLeftPane()}
             <div className="right-pane right-pane-chat">
+              {/* Chat header with branding */}
+              <div className="chat-header-brand">
+                <h1 className="chat-brand">Aegis<span>.</span></h1>
+              </div>
+
               {/* Compact summary bar - sticky */}
               <div className="summary-bar">
                 <div className="summary-info" onClick={() => setShowRedactionDetails(true)} title="Click to view redaction details">
@@ -600,8 +655,15 @@ function App() {
                           &#x21A9; Undo
                         </button>
                       )}
-                      {msg.undone && (
-                        <span className="undone-badge">Undone</span>
+                      {msg.undone && idx === lastUndoneIndex && redoAvailable && (
+                        <button
+                          className="redo-btn"
+                          onClick={() => handleRedo(idx)}
+                          disabled={chatLoading}
+                          title="Redo this redaction"
+                        >
+                          &#x21AA; Redo
+                        </button>
                       )}
                     </div>
                   ))}
@@ -633,26 +695,34 @@ function App() {
                   <div ref={chatEndRef} />
                 </div>
 
-                {/* Suggestion chips + info blurb */}
-                {showSuggestions && chatMessages.length <= 1 && (
-                  <div className="suggestions-area">
-                    <div className="suggestions-info">
-                      Try asking me to redact specific terms, entire PII categories, or explore document contents.
-                    </div>
-                    <div className="suggestions-chips">
-                      {suggestionChips.map((chip, idx) => (
-                        <button
-                          key={idx}
-                          className="suggestion-chip"
-                          onClick={() => sendChatMessage(chip.message)}
-                          disabled={chatLoading}
-                        >
-                          {chip.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                {/* Suggestion chips - always available, toggleable */}
+                <div className="suggestions-area">
+                  <button
+                    className="suggestions-toggle"
+                    onClick={() => setShowSuggestions(prev => !prev)}
+                  >
+                    Quick actions {showSuggestions ? '\u25B4' : '\u25BE'}
+                  </button>
+                  {showSuggestions && (
+                    <>
+                      <div className="suggestions-info">
+                        Try asking me to redact specific terms, entire PII categories, or explore document contents.
+                      </div>
+                      <div className="suggestions-chips">
+                        {suggestionChips.map((chip, idx) => (
+                          <button
+                            key={idx}
+                            className="suggestion-chip"
+                            onClick={() => sendChatMessage(chip.message)}
+                            disabled={chatLoading}
+                          >
+                            {chip.label}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
 
                 <div className="chat-input-bar">
                   <input
@@ -726,12 +796,14 @@ function App() {
         <div className="bubble bubble-5"></div>
         <div className="bubble bubble-6"></div>
       </div>
-      <header className="app-header">
-        <h1>Aegis<span>.</span></h1>
-        <p>
-          Automatically detect and permanently remove sensitive information from your PDF documents.
-        </p>
-      </header>
+      {status !== 'success' && (
+        <header className="app-header">
+          <h1>Aegis<span>.</span></h1>
+          <p>
+            Automatically detect and permanently remove sensitive information from your PDF documents.
+          </p>
+        </header>
+      )}
       <main className="main-card">
         {renderContent()}
       </main>

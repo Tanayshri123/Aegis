@@ -968,8 +968,8 @@ async def undo_redaction(job_id: str):
     """
     Undo the most recent chat-driven redaction.
 
-    Restores the previous redacted PDF, entity list, and page count
-    from the redaction history stack.
+    Saves the current state to a redo stack, then restores the previous
+    state from the undo (redaction_history) stack.
     """
     job = _jobs.get(job_id)
     if not job:
@@ -978,6 +978,13 @@ async def undo_redaction(job_id: str):
     history = job.get("redaction_history", [])
     if not history:
         raise HTTPException(status_code=400, detail="Nothing to undo")
+
+    # Save current state to redo stack before reverting
+    job.setdefault("redo_stack", []).append({
+        "redacted_path": job["redacted_path"],
+        "entities": list(job["entities"]),
+        "page_count": job["page_count"],
+    })
 
     prev = history.pop()
     job["redacted_path"] = prev["redacted_path"]
@@ -988,6 +995,41 @@ async def undo_redaction(job_id: str):
         "success": True,
         "entities": prev["entities"],
         "page_count": prev["page_count"],
+    }
+
+
+@app.post("/api/v1/jobs/{job_id}/redo")
+async def redo_redaction(job_id: str):
+    """
+    Redo a previously undone redaction.
+
+    Pops from the redo stack and pushes the current state back onto
+    the undo (redaction_history) stack.
+    """
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    redo_stack = job.get("redo_stack", [])
+    if not redo_stack:
+        raise HTTPException(status_code=400, detail="Nothing to redo")
+
+    # Save current state back to undo stack
+    job.setdefault("redaction_history", []).append({
+        "redacted_path": job["redacted_path"],
+        "entities": list(job["entities"]),
+        "page_count": job["page_count"],
+    })
+
+    redo = redo_stack.pop()
+    job["redacted_path"] = redo["redacted_path"]
+    job["entities"] = redo["entities"]
+    job["page_count"] = redo["page_count"]
+
+    return {
+        "success": True,
+        "entities": redo["entities"],
+        "page_count": redo["page_count"],
     }
 
 
@@ -1076,12 +1118,13 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
     job = _jobs[job_id]
     job["chat_redacting"] = True
 
-    # Save current state for undo
+    # Save current state for undo; clear redo stack (new action invalidates it)
     job.setdefault("redaction_history", []).append({
         "redacted_path": job["redacted_path"],
         "entities": list(job["entities"]),
         "page_count": job["page_count"],
     })
+    job["redo_stack"] = []
 
     try:
         from core.pii_detector import find_custom_entities
