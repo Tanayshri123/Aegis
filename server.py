@@ -589,6 +589,82 @@ async def chat_endpoint(job_id: str, body: ChatRequest):
     }
 
 
+def _normalize_for_match(text: str) -> str:
+    """Strip all dashes, hyphens (ASCII + unicode), spaces, and punctuation for fuzzy comparison."""
+    return re.sub(r'[-\s.,()\/\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]+', '', text).lower()
+
+
+def _fitz_fuzzy_search(page, value: str) -> list:
+    """
+    Find all bounding boxes for `value` on a fitz page using word-level
+    sliding-window matching.
+
+    PyMuPDF's page.search_for() only works when the target string exists as
+    a contiguous run in the PDF text layer. Many PDFs split values like
+    "KS070-45-878" across multiple internal text spans, so search_for() fails.
+
+    This function:
+      1. Tries page.search_for() (fast path for contiguous text)
+      2. Falls back to extracting every word with its bbox via get_text("words"),
+         then slides a window across adjacent words, normalizing away dashes/
+         spaces/punctuation, to find where the value lives — even if it's spread
+         across 1-8 separate word boxes.
+
+    Returns a list of fitz.Rect objects covering every occurrence found.
+    """
+    # Fast path: contiguous text match
+    rects = page.search_for(value)
+    if rects:
+        return rects
+
+    # Word-level fallback: get every word with its bbox
+    # get_text("words") returns list of (x0, y0, x1, y1, "word", block, line, word_no)
+    words = page.get_text("words")
+    if not words:
+        return []
+
+    # Sort by reading order (top-to-bottom, left-to-right)
+    words = sorted(words, key=lambda w: (w[1], w[0]))
+
+    norm_value = _normalize_for_match(value)
+    if not norm_value:
+        return []
+
+    found_rects = []
+
+    # Sliding window: combine up to 10 adjacent words and check if the
+    # normalized target appears in the normalized concatenation.
+    for i in range(len(words)):
+        combined = ""
+        for j in range(i, min(i + 10, len(words))):
+            combined += words[j][4]  # raw word text
+            norm_combined = _normalize_for_match(combined)
+
+            if norm_value in norm_combined:
+                # Merge bboxes of words[i..j]
+                merged = fitz.Rect(
+                    min(words[k][0] for k in range(i, j + 1)),
+                    min(words[k][1] for k in range(i, j + 1)),
+                    max(words[k][2] for k in range(i, j + 1)),
+                    max(words[k][3] for k in range(i, j + 1)),
+                )
+                # Avoid duplicate rects for overlapping windows
+                is_dup = any(
+                    abs(existing.x0 - merged.x0) < 1 and abs(existing.y0 - merged.y0) < 1
+                    for existing in found_rects
+                )
+                if not is_dup:
+                    found_rects.append(merged)
+                break  # Move to next starting position
+
+            # If the normalized combined text is already longer than the target,
+            # no point extending the window further.
+            if len(norm_combined) > len(norm_value) * 2:
+                break
+
+    return found_rects
+
+
 async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
     """
     Execute a chat-driven redaction: find custom entities, locate bboxes, redact.
@@ -630,7 +706,82 @@ async def _execute_chat_redaction(job_id: str, terms: list) -> dict:
 
         entities_with_bbox = [e for e in new_entities if e.bbox is not None]
 
+        # 2b. Fallback: if Nemotron couldn't locate bboxes, use PyMuPDF's
+        #     native text search on the PDF's text layer. This handles cases
+        #     where Nemotron returns zero elements or tokenizes the value in
+        #     a way the fuzzy matcher can't reassemble.
+        used_fitz_fallback = False
         if not entities_with_bbox:
+            print(f"  Nemotron bbox lookup failed for {terms!r}, trying PyMuPDF word-level fallback...")
+            current_redacted = job["redacted_path"]
+            doc = fitz.open(current_redacted)
+            fallback_count = 0
+            fallback_pages = set()
+
+            for entity in new_entities:
+                if entity.bbox is not None:
+                    continue
+                fitz_page_idx = entity.page - 1  # fitz is 0-indexed
+                if fitz_page_idx < 0 or fitz_page_idx >= len(doc):
+                    continue
+                page = doc[fitz_page_idx]
+                rects = _fitz_fuzzy_search(page, entity.value)
+
+                if rects:
+                    print(f"  Fallback: found {len(rects)} rect(s) for {entity.value!r} on page {entity.page}")
+                    for rect in rects:
+                        page.add_redact_annot(rect, fill=(0, 0, 0))
+                        fallback_count += 1
+                    fallback_pages.add(entity.page)
+                else:
+                    print(f"  Fallback: no match for {entity.value!r} on page {entity.page}")
+
+            if fallback_count > 0:
+                # Apply redactions on all affected pages
+                for page_num in fallback_pages:
+                    doc[page_num - 1].apply_redactions()
+
+                # Save to a new file (same collision-safe pattern as redact_pdf)
+                from core.redactor import _build_output_path
+                new_redacted_path = _build_output_path(current_redacted)
+                doc.save(new_redacted_path, garbage=4, deflate=True)
+                doc.close()
+
+                print(f"  PyMuPDF fallback: redacted {fallback_count} rect(s) on page(s) {sorted(fallback_pages)}")
+                used_fitz_fallback = True
+
+                # Update job state
+                job["redacted_path"] = new_redacted_path
+                verify_doc = fitz.open(new_redacted_path)
+                job["page_count"] = len(verify_doc)
+                verify_doc.close()
+
+                for entity in new_entities:
+                    job["entities"].append({
+                        "type": entity.type,
+                        "value": entity.value,
+                        "page": entity.page,
+                        "confidence": round(entity.confidence, 2),
+                    })
+
+                affected_pages = sorted(fallback_pages)
+                reply = (
+                    f"Done! Redacted {fallback_count} occurrence(s) of "
+                    f"{', '.join(repr(t) for t in terms)} on page(s) {', '.join(str(p) for p in affected_pages)}."
+                )
+                job["chat_history"].append({"role": "assistant", "content": reply})
+                job["pending_redaction"] = None
+
+                return {
+                    "reply": reply,
+                    "pages_referenced": affected_pages,
+                    "redaction_request": None,
+                    "pdf_updated": True,
+                }
+            else:
+                doc.close()
+
+        if not entities_with_bbox and not used_fitz_fallback:
             job["chat_redacting"] = False
             reply = (
                 f"Found text matching {', '.join(repr(t) for t in terms)} but couldn't "

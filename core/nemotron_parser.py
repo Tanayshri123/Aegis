@@ -248,7 +248,7 @@ def _parse_bbox_response(content: str) -> List[Dict]:
 
 def _normalize(text: str) -> str:
     """Strip dashes, spaces, and punctuation for fuzzy comparison."""
-    return re.sub(r'[-\s.,()\u2010-\u2015]+', '', text).lower()
+    return re.sub(r'[-\s.,()\/\u2010-\u2015]+', '', text).lower()
 
 
 def _merge_bboxes(bboxes: List[List[float]]) -> List[float]:
